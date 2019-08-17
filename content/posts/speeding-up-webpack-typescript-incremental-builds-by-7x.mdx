@@ -1,0 +1,146 @@
+---
+path: /speeding-up-webpack-typescript-incremental-builds-by-7x/
+date: 2019-08-16T22:56:11.257Z
+title: Speeding Up Webpack Typescript Incremental Builds by 7x
+heroImage: /assets/localize-bg.png
+---
+
+What if I told you your Webpack is doing too much work all this time? Webpack 4 brought a lot of goodies for developers but to use it at scale, the Outlook team at Microsoft had to take a hard look at the incremental build numbers to find out. Here’s how we made our incremental builds go from 35s to a consistent 5s.
+
+I guess it goes without saying that you MUST measure in order for you to know you have made progress!
+
+Let’s name some enemies of incremental build speed:
+
+1. stats.toJson()
+2. Competing resolution logic between Webpack and its loaders (ts-loader)
+3. Garbage Collection
+4. Subtle v8 ES6 perfomance issues
+5. The Base Line
+
+To begin, there are already a few things beyond setting the mode in webpack.config.js we already apply so we’re not doing too much optimization during incremental builds:
+
+```json
+{
+  "optimization": {
+    "removeAvailableModules": false,
+    "removeEmptyChunks": false,
+    "splitChunks": false
+  }
+}
+```
+
+Alright, so let’s establish the baseline by looking at a typical inner loop flame graph:
+
+As you can see, we’re clocking in at around 40s here per incremental build. This is not exactly true because we lose about 5s of it due to profiling. In measuring with our internal telemetry, we noticed that our devs are hitting around 30–35s on avg (and sometimes over a minute at the 75th percentile) incremental builds.
+
+So, as soon as you look at those colors, you would recognize three separate phases of the incremental build process. With this in mind, let’s tackle the first enemy.
+
+## Enemy #1: stats.toJson is VERY heavy in WP4
+
+If you were looking at the the CPU profile flame graph, you would notice that the last phase of the process is dominated by a bunch of stats.toJson calls. Where does it come from? It’s right inside webpack-dev-server’s Server.js:
+
+```js
+const clientStats = { errorDetails: false };
+...
+comp.hooks.done.tap('webpack-dev-server', (stats) => {
+this.\_sendStats(this.sockets, stats.toJson(clientStats));
+this.\_stats = stats;
+});
+```
+
+The issue here is that Webpack 4 gave `toJson` a lot more information, but it also regressed the performance tremendously as a result. The fix is in a pull request:
+
+https://github.com/webpack/webpack-dev-server/pull/1362
+
+This is the big one — it brought our incremental speeds from 30s to around 15s.
+
+> Update: the webpack-dev-server maintainers had accepted my patch! So, go ahead and use webpack-dev-server@3.1.2. Personally, I have observed a slight 0.5s regression between 2.x release and the 3.x release, so we’re keeping the 2.x for now until we can move to using webpack-serve.
+
+Since we’re waiting for the authors to merge this for v2, I’ve published a temporary fork for it for the v2 branch:
+
+https://www.npmjs.com/package/webpack-dev-server-speedy
+
+For the fix on v2, you’ll have to use the node API to take advantage of it like this package in your build process:
+
+```js
+const Webpack = require("webpack")
+const WebpackDevServer = require("webpack-dev-server-speedy")
+const webpackConfig = require("./webpack.config")
+const compiler = Webpack(webpackConfig)
+const devServerOptions = Object.assign({}, webpackConfig.devServer, {
+  stats: {
+    colors: true,
+  },
+})
+
+const server = new WebpackDevServer(compiler, devServerOptions)
+
+server.listen(8080, "127.0.0.1", () => {
+  console.log("Starting server on http://localhost:8080")
+})
+```
+
+## Enemy #2: Competing resolution logic between Webpack and ts-loader
+
+If I were to ask you to build an incremental compiler based on Typescript, you would likely first reach into the Typescript API for something that it is using for its watch mode. For the longest time, Typescript safe guarded this API from external modules. During this time, ts-loader was born. The author of the loader tracked the progress of another Typescript-centric loader called awesome-typescript-loader and brought back the idea of doing type checking on a separate thread. This transpileOnly flag worked remarkably well (with a rather glaring caveat that const enums are not supported out of the box — here’s a workaround from the ts-jest repo) until the codebase reaches a certain size.
+
+In OWA, we have nearly 9000 modules that we shove across this loader. We have found that the first phase of that incremental build is linearly growing as our repo grows.
+
+Things looked pretty grim until the Typescript team decided to take on this mammoth work of expose the watch API to external modules. Specifically, after this was merged, ts-loader is super charged with the ability to limit the amount of modules to transpile at a time per iteration!
+
+We just add this to our webpack config module.rules:
+
+```json
+{
+  "test": /\.tsx?\$/,
+  "use": [
+    {
+      "loader": "ts-loader",
+      "options": {
+        "transpileOnly": true,
+        "experimentalWatchApi": true
+      }
+    }
+  ]
+}
+```
+
+Don’t forget to the typechecker when appropriate: https://www.npmjs.com/package/fork-ts-checker-webpack-plugin (we have a mode to turn type checker OFF for even faster rebuilds)
+
+The incremental builds now only rebuilds around 30–40 modules rather than 50% of our modules! I also have a way to CAP the growth of the incremental builds in the first phase.
+
+This optimization cuts our 15s to around 8s.
+
+## Enemy #3: Garbage Collection
+
+So Garbage Collection is a great invention. But not in a tight loop. Perhaps there’s a perf bug inside node or v8, but I’ve discovered that a global string.replace(/…/g, ‘…..’) can cause a lot of GC when placed inside a loop. Webpack 4 introduced the path info in the generated dev mode replacing module ids with more useful path info. This is done with, you guessed it, global string replace with regex. It then created a LOT of unnecessary GCs along the way. (as an aside, perhaps I should file a bug against either Webpack, node, or v8…)
+
+Okay, let’s turn that sucker off in webpack.config.js in the output.pathinfo:
+
+```json
+{
+  "output": {
+    "pathinfo": false
+  }
+}
+```
+
+Just ask yourself if you REALLY need that pathinfo or that build speed. For us, we chose speed. This made our 8s builds to around 6s
+
+## Enemy #4: Subtle v8 ES6 perfomance issues
+
+Most everyone would be pleased with that 6s figure, but why should we humans not demand MOAR? Yes, MOAR speed!!!
+
+In chatting with a colleague of mine, John-David Dalton, about his project, esm, he told me about node.js performance issues with ES6 data structures like Map and Set. Having dug into Webpack source code previously and by looking at the remaining profile slowdowns (looking at the “heavy” or “bottom-up”), I noticed that Webpack’s internal algorithm is dominated by calling their SortableSet methods. Since SortableSet extends Set, it would follow that Webpack is actually greatly affected by the speed of the Map/Set implementation of V8. Here’s the bug:
+
+https://github.com/nodejs/node/issues/19769
+
+So, I advise everyone doing heavy Webpack development to switch to the LTS (v10+ or stick with v8.9.4)
+
+Using that version, the incremental build is down to 4.5s
+
+## Why? Inventing on Principle!
+
+Finally, I want to leave you with the best motivation on why we should reduce this incremental build speeds down to almost nothing:
+
+Hey! follow me on twitter @kenneth_chau to get more articles like these :)
